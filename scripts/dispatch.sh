@@ -1,5 +1,5 @@
 #!/bin/bash
-# dispatch.sh — 调度开发任务到 Cursor Agent，完成后通过 OpenClaw 通知
+# dispatch.sh — 调度开发任务到 Cursor Agent CLI，完成后通过 OpenClaw 通知
 #
 # Usage:
 #   dispatch.sh [OPTIONS] -p "your prompt here"
@@ -12,13 +12,20 @@
 #   --callback-group ID           Telegram group for callback
 #   --callback-dm ID              Telegram user ID for DM callback
 #   --callback-account NAME       Telegram bot account name for DM
-#   --permission-mode MODE        Permission mode (ask/auto/bypass)
-#   --model MODEL                 Model override
+#   --model MODEL                 Model override (e.g. gpt-5, sonnet-4)
+#   --yolo                        Auto-approve all commands
+#   --mode MODE                   Agent mode (plan/ask, default: agent)
+#   --output-format FORMAT        Output format (text/json/stream-json)
+#
+# Cursor Agent CLI reference:
+#   Interactive:  agent "prompt"
+#   Headless:     agent -p "prompt" --trust --output-format text
+#   Docs:         https://cursor.com/docs/cli/overview
 #
 # Environment variables:
 #   RESULT_DIR                    Result storage dir (default: ./data/cursor-agent-results)
 #   OPENCLAW_BIN                  Path to openclaw CLI (default: auto-detect)
-#   CURSOR_BIN                    Path to cursor CLI (default: auto-detect)
+#   AGENT_BIN                     Path to agent CLI (default: auto-detect)
 
 set -euo pipefail
 
@@ -40,8 +47,10 @@ CALLBACK_GROUP=""
 CALLBACK_DM=""
 CALLBACK_ACCOUNT=""
 WORKDIR="$(pwd)"
-PERMISSION_MODE=""
 MODEL=""
+YOLO=""
+MODE=""
+OUTPUT_FORMAT="text"
 
 # ---- 参数解析 ----
 while [[ $# -gt 0 ]]; do
@@ -53,8 +62,10 @@ while [[ $# -gt 0 ]]; do
     --callback-dm)        CALLBACK_DM="$2";      shift 2;;
     --callback-account)   CALLBACK_ACCOUNT="$2"; shift 2;;
     -w|--workdir)         WORKDIR="$2";          shift 2;;
-    --permission-mode)    PERMISSION_MODE="$2";  shift 2;;
     --model)              MODEL="$2";            shift 2;;
+    --yolo)               YOLO="1";              shift;;
+    --mode)               MODE="$2";             shift 2;;
+    --output-format)      OUTPUT_FORMAT="$2";    shift 2;;
     *)  echo "Unknown option: $1" >&2; exit 1;;
   esac
 done
@@ -98,6 +109,7 @@ jq -n \
   --arg prompt "$PROMPT" \
   --arg workdir "$WORKDIR" \
   --arg ts "$(date -Iseconds)" \
+  --arg model "${MODEL:-default}" \
   '{
     task_name: $name,
     telegram_group: $group,
@@ -107,6 +119,7 @@ jq -n \
     prompt: $prompt,
     workdir: $workdir,
     started_at: $ts,
+    model: $model,
     status: "running"
   }' \
   > "$META_FILE"
@@ -114,16 +127,19 @@ jq -n \
 echo "[dispatch] Task metadata written: $META_FILE"
 echo "  Task:    $TASK_NAME"
 echo "  Workdir: $WORKDIR"
+echo "  Model:   ${MODEL:-default}"
 echo "  Group:   ${TELEGRAM_GROUP:-none}"
 
 # ---- 2. 清空上次输出 ----
 > "$TASK_OUTPUT"
 
 # ---- 3. 构建运行命令 ----
-CMD=(python3 "$RUNNER" -p "$PROMPT" --cwd "$WORKDIR")
+CMD=(python3 "$RUNNER" -p "$PROMPT" --cwd "$WORKDIR" --workspace "$WORKDIR")
 
-[ -n "$PERMISSION_MODE" ] && CMD+=(--permission-mode "$PERMISSION_MODE")
-[ -n "$MODEL" ] && CMD+=(--model "$MODEL")
+[ -n "$MODEL" ]         && CMD+=(--model "$MODEL")
+[ -n "$YOLO" ]          && CMD+=(--yolo)
+[ -n "$MODE" ]          && CMD+=(--mode "$MODE")
+[ -n "$OUTPUT_FORMAT" ] && CMD+=(--output-format "$OUTPUT_FORMAT")
 
 # ---- 4. 启动 Cursor Agent ----
 echo "[dispatch] Launching Cursor Agent..."
@@ -143,7 +159,7 @@ if [ -f "$META_FILE" ]; then
     "$META_FILE" > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
 fi
 
-# ---- 6. 触发通知（如果 notify-hook.sh 存在） ----
+# ---- 6. 触发通知 ----
 NOTIFY_HOOK="${SCRIPT_DIR}/notify-hook.sh"
 if [ -x "$NOTIFY_HOOK" ]; then
   echo "[dispatch] Triggering notification hook..."

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""cursor_agent_run.py — 可靠地运行 Cursor Agent（headless 或 tmux 交互模式）
+"""cursor_agent_run.py — 可靠地运行 Cursor Agent CLI
 
-默认模式为 auto：
-- 如果 prompt 包含斜杠命令（如 /xxx），启动 tmux 交互模式
-- 否则通过 script(1) 在伪终端中运行 headless 模式
+支持两种模式：
+- headless（非交互）：通过 `agent -p "prompt" --trust` 执行，适用于 CI / 自动化
+- interactive（交互）：通过 tmux 启动 `agent "prompt"`，适用于斜杠命令交互场景
 
-为什么需要这个包装器：
-- Cursor Agent 在无 TTY 环境下可能挂起
-- CI / exec 环境通常是非交互式的
-- script(1) 能强制分配伪终端
+Cursor Agent CLI 参考：
+- 交互模式：agent "prompt"
+- 非交互模式：agent -p "prompt" --output-format text --trust
+- 完整文档：https://cursor.com/docs/cli/overview
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_CURSOR = os.environ.get("CURSOR_BIN", "cursor")
+DEFAULT_AGENT_BIN = os.environ.get("AGENT_BIN", "agent")
 
 
 def which(name: str) -> str | None:
@@ -42,23 +42,45 @@ def looks_like_slash_commands(prompt: str | None) -> bool:
     if not prompt:
         return False
     for line in prompt.splitlines():
-        if line.strip().startswith("/"):
+        stripped = line.strip()
+        if stripped.startswith("/") and not stripped.startswith("//"):
             return True
     return False
 
 
 def build_headless_cmd(args: argparse.Namespace) -> list[str]:
-    """Build the CLI command for headless (non-interactive) execution."""
-    cmd: list[str] = [args.cursor_bin, "agent"]
+    """Build the CLI command for headless (non-interactive) execution.
 
-    if args.prompt is not None:
-        cmd += ["-m", args.prompt]
+    agent -p "prompt" --trust --output-format text [--model X] [--workspace W] [--yolo]
+    """
+    cmd: list[str] = [args.agent_bin]
 
-    if args.permission_mode:
-        cmd += ["--permission-mode", args.permission_mode]
+    # -p / --print: 非交互模式，输出到 stdout
+    cmd.append("-p")
+
+    # --trust: 免信任提示（headless 必需）
+    cmd.append("--trust")
+
+    if args.output_format:
+        cmd += ["--output-format", args.output_format]
 
     if args.model:
         cmd += ["--model", args.model]
+
+    if args.workspace:
+        cmd += ["--workspace", args.workspace]
+    elif args.cwd:
+        cmd += ["--workspace", args.cwd]
+
+    if args.yolo:
+        cmd.append("--yolo")
+
+    if args.mode:
+        cmd += ["--mode", args.mode]
+
+    # prompt 作为位置参数放最后
+    if args.prompt:
+        cmd.append(args.prompt)
 
     if args.extra:
         cmd += args.extra
@@ -116,7 +138,10 @@ def tmux_wait_for_text(
 
 
 def run_interactive_tmux(args: argparse.Namespace) -> int:
-    """Run Cursor Agent in tmux for interactive slash-command workflows."""
+    """Run Cursor Agent in tmux for interactive slash-command workflows.
+
+    tmux 中执行: agent "prompt" [--model X] [--workspace W]
+    """
     if not which("tmux"):
         print("[runner] tmux not found in PATH", file=sys.stderr)
         return 2
@@ -139,17 +164,21 @@ def run_interactive_tmux(args: argparse.Namespace) -> int:
         tmux_cmd(socket_path, "new", "-d", "-s", session, "-n", "shell"),
     )
 
-    cwd = args.cwd or os.getcwd()
+    cwd = args.workspace or args.cwd or os.getcwd()
 
-    cursor_parts = [args.cursor_bin, "agent"]
-    if args.permission_mode:
-        cursor_parts += ["--permission-mode", args.permission_mode]
+    # 构建交互模式命令: agent "prompt" --model X --workspace W
+    agent_parts: list[str] = [args.agent_bin]
     if args.model:
-        cursor_parts += ["--model", args.model]
+        agent_parts += ["--model", args.model]
+    if args.yolo:
+        agent_parts.append("--yolo")
+    if args.mode:
+        agent_parts += ["--mode", args.mode]
+    agent_parts += ["--workspace", cwd]
     if args.extra:
-        cursor_parts += args.extra
+        agent_parts += args.extra
 
-    launch = f"cd {shlex.quote(cwd)} && " + " ".join(shlex.quote(p) for p in cursor_parts)
+    launch = " ".join(shlex.quote(p) for p in agent_parts)
     subprocess.check_call(
         tmux_cmd(socket_path, "send-keys", "-t", target, "-l", "--", launch),
     )
@@ -159,10 +188,11 @@ def run_interactive_tmux(args: argparse.Namespace) -> int:
 
     # 等待 workspace trust prompt
     if tmux_wait_for_text(socket_path, target, "trust", timeout_s=20):
+        subprocess.run(tmux_cmd(socket_path, "send-keys", "-t", target, "y"), check=False)
         subprocess.run(tmux_cmd(socket_path, "send-keys", "-t", target, "Enter"), check=False)
         time.sleep(0.8)
 
-    # 发送 prompt
+    # 发送 prompt（交互模式下作为第一条消息输入）
     if args.prompt:
         time.sleep(2)
         for line in [ln for ln in args.prompt.splitlines() if ln.strip()]:
@@ -192,22 +222,34 @@ def run_interactive_tmux(args: argparse.Namespace) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Run Cursor Agent reliably (headless or interactive via tmux)",
+        description="Run Cursor Agent CLI reliably (headless or interactive via tmux)",
     )
 
     ap.add_argument("-p", "--prompt", help="Task prompt text")
     ap.add_argument(
-        "--mode", choices=["auto", "headless", "interactive"], default="auto",
+        "--run-mode", choices=["auto", "headless", "interactive"], default="auto",
         help="Execution mode. auto = interactive if prompt has slash commands, else headless",
     )
     ap.add_argument(
-        "--permission-mode", default=None,
-        help="Permission mode passed to cursor agent (e.g. ask, auto, bypass)",
+        "--mode", default=None, choices=["plan", "ask"],
+        help="Agent execution mode (plan / ask). Default is agent mode.",
     )
-    ap.add_argument("--model", default=None, help="Model override")
+    ap.add_argument("--model", default=None, help="Model override (e.g. gpt-5, sonnet-4)")
     ap.add_argument(
-        "--cursor-bin", default=DEFAULT_CURSOR,
-        help=f"Path to cursor binary (default: {DEFAULT_CURSOR}). Or set CURSOR_BIN env.",
+        "--yolo", action="store_true", default=False,
+        help="Force allow all commands (alias for --force)",
+    )
+    ap.add_argument(
+        "--output-format", default="text", choices=["text", "json", "stream-json"],
+        help="Output format for headless mode (default: text)",
+    )
+    ap.add_argument(
+        "--workspace", default=None,
+        help="Workspace directory for agent",
+    )
+    ap.add_argument(
+        "--agent-bin", default=DEFAULT_AGENT_BIN,
+        help=f"Path to agent binary (default: {DEFAULT_AGENT_BIN}). Or set AGENT_BIN env.",
     )
     ap.add_argument("--cwd", help="Working directory (defaults to current directory)")
 
@@ -227,14 +269,15 @@ def main() -> int:
         extra = extra[1:]
     args.extra = extra
 
-    # 检测 cursor 可执行文件
-    cursor_path = which(args.cursor_bin) if not Path(args.cursor_bin).exists() else args.cursor_bin
-    if not cursor_path:
-        print(f"[runner] cursor binary not found: {args.cursor_bin}", file=sys.stderr)
-        print("Tip: set CURSOR_BIN=/path/to/cursor", file=sys.stderr)
+    # 检测 agent 可执行文件
+    agent_path = which(args.agent_bin)
+    if not agent_path and not Path(args.agent_bin).exists():
+        print(f"[runner] agent binary not found: {args.agent_bin}", file=sys.stderr)
+        print("Tip: install via `curl https://cursor.com/install -fsS | bash`", file=sys.stderr)
+        print("  or set AGENT_BIN=/path/to/agent", file=sys.stderr)
         return 2
 
-    mode = args.mode
+    mode = args.run_mode
     if mode == "auto" and looks_like_slash_commands(args.prompt):
         mode = "interactive"
 
